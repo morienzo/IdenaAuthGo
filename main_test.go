@@ -1,98 +1,301 @@
 package main
 
 import (
-	"bytes"
-	"crypto/ecdsa"
-	"encoding/hex"
+	"database/sql"
 	"encoding/json"
-	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/ethereum/go-ethereum/crypto"
+	_ "github.com/mattn/go-sqlite3"
 )
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
+func TestMain(m *testing.M) {
+	// Setup
+	os.Setenv("BASE_URL", "http://localhost:3030")
+	os.Setenv("IDENA_RPC_KEY", "test_key")
+	
+	// Run tests
+	code := m.Run()
+	
+	// Teardown
+	os.Remove("test_identities.db")
+	
+	os.Exit(code)
 }
 
-func signMessage(priv *ecdsa.PrivateKey, msg string) string {
-	h := crypto.Keccak256(crypto.Keccak256([]byte(msg)))
-	sig, _ := crypto.Sign(h, priv)
-	return hex.EncodeToString(sig)
-}
-
-func TestVerifySignature(t *testing.T) {
-	priv, err := crypto.GenerateKey()
+func setupTestDB() (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
-		t.Fatalf("generate key: %v", err)
+		return nil, err
 	}
-	addr := crypto.PubkeyToAddress(priv.PublicKey).Hex()
-	nonce := "test-nonce"
-	sigHex := signMessage(priv, nonce)
-	if !verifySignature(nonce, addr, sigHex) {
-		t.Fatalf("expected valid signature")
+
+	createTables := `
+	CREATE TABLE identities (
+		address TEXT PRIMARY KEY,
+		state TEXT NOT NULL,
+		stake REAL NOT NULL,
+		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	`
+
+	_, err = db.Exec(createTables)
+	return db, err
+}
+
+func insertTestData(db *sql.DB) error {
+	testData := []struct {
+		address string
+		state   string
+		stake   float64
+	}{
+		{"0x1234567890abcdef1234567890abcdef12345678", "Human", 15000},
+		{"0xabcdef1234567890abcdef1234567890abcdef12", "Verified", 25000},
+		{"0x9876543210fedcba9876543210fedcba98765432", "Newbie", 5000},
+		{"0xfedcba0987654321fedcba0987654321fedcba09", "Candidate", 12000},
 	}
-	if verifySignature(nonce, addr, "deadbeef") {
-		t.Fatalf("expected invalid signature")
+
+	for _, data := range testData {
+		_, err := db.Exec(
+			"INSERT INTO identities (address, state, stake) VALUES (?, ?, ?)",
+			data.address, data.state, data.stake,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func TestCheckEligibility(t *testing.T) {
+	db, err := setupTestDB()
+	if err != nil {
+		t.Fatalf("DB setup error: %v", err)
+	}
+	defer db.Close()
+
+	if err := insertTestData(db); err != nil {
+		t.Fatalf("Data insertion error: %v", err)
+	}
+
+	server := &Server{db: db}
+
+	tests := []struct {
+		address  string
+		eligible bool
+		reason   string
+	}{
+		{
+			address:  "0x1234567890abcdef1234567890abcdef12345678",
+			eligible: true,
+			reason:   "Eligible",
+		},
+		{
+			address:  "0x9876543210fedcba9876543210fedcba98765432",
+			eligible: false,
+			reason:   "Insufficient stake: 5000.00 iDNA (minimum 10,000)",
+		},
+		{
+			address:  "0xfedcba0987654321fedcba0987654321fedcba09",
+			eligible: false,
+			reason:   "Ineligible state: Candidate",
+		},
+		{
+			address:  "0xinexistant",
+			eligible: false,
+			reason:   "Address not found in database",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.address, func(t *testing.T) {
+			eligible, reason := server.checkEligibility(test.address)
+			
+			if eligible != test.eligible {
+				t.Errorf("Expected eligible=%v, got=%v", test.eligible, eligible)
+			}
+			
+			if reason != test.reason {
+				t.Errorf("Expected reason=%q, got=%q", test.reason, reason)
+			}
+		})
 	}
 }
 
-func TestGetIdentityRpc(t *testing.T) {
-	oldClient := http.DefaultClient
-	defer func() { http.DefaultClient = oldClient }()
+func TestWhitelistEndpoint(t *testing.T) {
+	db, err := setupTestDB()
+	if err != nil {
+		t.Fatalf("Erreur de setup DB: %v", err)
+	}
+	defer db.Close()
 
-	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.String() != idenaRpcUrl {
-			t.Fatalf("unexpected url %s", req.URL.String())
-		}
-		resp := map[string]interface{}{
-			"result": map[string]string{
-				"state": "Human",
-				"stake": "15000",
-			},
-		}
-		b, _ := json.Marshal(resp)
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(b)), Header: make(http.Header)}, nil
-	})}
+	if err := insertTestData(db); err != nil {
+		t.Fatalf("Erreur d'insertion de données: %v", err)
+	}
 
-	state, stake := getIdentity("0xabc")
-	if state != "Human" || stake != 15000 {
-		t.Fatalf("unexpected result %s %.f", state, stake)
+	server := &Server{db: db}
+
+	req, err := http.NewRequest("GET", "/whitelist", nil)
+	if err != nil {
+		t.Fatalf("Erreur de création de requête: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	handler := http.HandlerFunc(server.handleWhitelist)
+	handler.ServeHTTP(rr, req)
+
+	if status := rr.Code; status != http.StatusOK {
+		t.Errorf("Wrong status code: got %v, expected %v", status, http.StatusOK)
+	}
+
+	var response WhitelistResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Response parsing error: %v", err)
+	}
+
+	// Should have 2 eligible addresses (Human with 15000 and Verified with 25000)
+	expectedCount := 2
+	if response.Count != expectedCount {
+		t.Errorf("Expected count=%d, got=%d", expectedCount, response.Count)
+	}
+
+	if len(response.Addresses) != expectedCount {
+		t.Errorf("Expected %d addresses, got %d", expectedCount, len(response.Addresses))
+	}, len(response.Addresses))
 	}
 }
 
-func TestGetIdentityFallback(t *testing.T) {
-	calls := 0
-	oldClient := http.DefaultClient
-	defer func() { http.DefaultClient = oldClient }()
-
-	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		calls++
-		switch req.URL.String() {
-		case idenaRpcUrl:
-			return &http.Response{StatusCode: 500, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
-		case fallbackApiUrl + "/api/Identity/0xabc":
-			resp := map[string]interface{}{"result": map[string]string{"state": "Verified"}}
-			b, _ := json.Marshal(resp)
-			return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(b)), Header: make(http.Header)}, nil
-		case fallbackApiUrl + "/api/Address/0xabc":
-			resp := map[string]interface{}{"result": map[string]string{"stake": "9000"}}
-			b, _ := json.Marshal(resp)
-			return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(b)), Header: make(http.Header)}, nil
-		default:
-			t.Fatalf("unexpected url %s", req.URL.String())
-		}
-		return nil, nil
-	})}
-
-	state, stake := getIdentity("0xabc")
-	if state != "Verified" || stake != 9000 {
-		t.Fatalf("unexpected fallback result %s %.f", state, stake)
+func TestWhitelistCheckEndpoint(t *testing.T) {
+	db, err := setupTestDB()
+	if err != nil {
+		t.Fatalf("DB setup error: %v", err)
 	}
-	if calls != 3 {
-		t.Fatalf("expected 3 calls, got %d", calls)
+	defer db.Close()
+
+	if err := insertTestData(db); err != nil {
+		t.Fatalf("Data insertion error: %v", err)
+	}
+
+	server := &Server{db: db}
+
+	// Test with eligible address
+	req, err := http.NewRequest("GET", "/whitelist/check?address=0x1234567890abcdef1234567890abcdef12345678", nil)
+	if err != nil {
+		t.Fatalf("Request creation error: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	handler := http.HandlerFunc(server.handleWhitelistCheck)
+	handler.ServeHTTP(rr, req)
+
+	if status := rr.Code; status != http.StatusOK {
+		t.Errorf("Wrong status code: got %v, expected %v", status, http.StatusOK)
+	}
+
+	var response EligibilityCheck
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Response parsing error: %v", err)
+	}
+
+	if !response.Eligible {
+		t.Errorf("Address should be eligible")
+	}
+}
+
+func TestMerkleRootEndpoint(t *testing.T) {
+	db, err := setupTestDB()
+	if err != nil {
+		t.Fatalf("Erreur de setup DB: %v", err)
+	}
+	defer db.Close()
+
+	if err := insertTestData(db); err != nil {
+		t.Fatalf("Erreur d'insertion de données: %v", err)
+	}
+
+	server := &Server{db: db}
+
+	req, err := http.NewRequest("GET", "/merkle_root", nil)
+	if err != nil {
+		t.Fatalf("Erreur de création de requête: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	handler := http.HandlerFunc(server.handleMerkleRoot)
+	handler.ServeHTTP(rr, req)
+
+	if status := rr.Code; status != http.StatusOK {
+		t.Errorf("Mauvais status code: obtenu %v, attendu %v", status, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Response parsing error: %v", err)
+	}
+
+	if response["merkle_root"] == nil {
+		t.Error("merkle_root missing in response")
+	}
+
+	if response["addresses_count"] == nil {
+		t.Error("addresses_count missing in response")
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	db, err := setupTestDB()
+	if err != nil {
+		t.Fatalf("Erreur de setup DB: %v", err)
+	}
+	defer db.Close()
+
+	server := &Server{db: db}
+
+	req, err := http.NewRequest("GET", "/health", nil)
+	if err != nil {
+		t.Fatalf("Erreur de création de requête: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	handler := http.HandlerFunc(server.handleHealth)
+	handler.ServeHTTP(rr, req)
+
+	if status := rr.Code; status != http.StatusOK {
+		t.Errorf("Wrong status code: got %v, expected %v", status, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Response parsing error: %v", err)
+	}
+
+	if response["status"] != "healthy" {
+		t.Errorf("Expected status=healthy, got=%v", response["status"])
+	}
+}
+
+// Benchmark for performance
+func BenchmarkCheckEligibility(b *testing.B) {
+	db, err := setupTestDB()
+	if err != nil {
+		b.Fatalf("DB setup error: %v", err)
+	}
+	defer db.Close()
+
+	if err := insertTestData(db); err != nil {
+		b.Fatalf("Data insertion error: %v", err)
+	}
+
+	server := &Server{db: db}
+	address := "0x1234567890abcdef1234567890abcdef12345678"
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		server.checkEligibility(address)
 	}
 }
