@@ -1,31 +1,26 @@
+// agents/identity_fetcher.go - Fixed agent
 package main
 
 import (
+	"bufio"
 	"bytes"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"strings"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
-type IndexerConfig struct {
+type FetcherConfig struct {
 	RPCURL          string `json:"rpc_url"`
 	RPCKey          string `json:"rpc_key"`
-	IntervalMinutes int    `json:"interval_minutes"`
-	DBPath          string `json:"db_path"`
-}
-
-type IdenaIdentity struct {
-	Address string  `json:"address"`
-	State   string  `json:"state"`
-	Stake   float64 `json:"stake"`
+	OutputFile      string `json:"output_file"`
+	AddressListFile string `json:"address_list_file"`
+	BatchSize       int    `json:"batch_size"`
+	TimeoutSeconds  int    `json:"timeout_seconds"`
 }
 
 type RPCRequest struct {
@@ -35,9 +30,9 @@ type RPCRequest struct {
 }
 
 type RPCResponse struct {
-	Result []IdenaIdentity `json:"result"`
-	Error  *RPCError       `json:"error"`
-	ID     int             `json:"id"`
+	Result *IdentityInfo `json:"result"`
+	Error  *RPCError     `json:"error"`
+	ID     int           `json:"id"`
 }
 
 type RPCError struct {
@@ -45,364 +40,208 @@ type RPCError struct {
 	Message string `json:"message"`
 }
 
-type Indexer struct {
-	config IndexerConfig
-	db     *sql.DB
+type IdentityInfo struct {
+	Address string  `json:"address"`
+	State   string  `json:"state"`
+	Stake   float64 `json:"stake"`
+}
+
+type Snapshot struct {
+	Timestamp  time.Time       `json:"timestamp"`
+	Identities []IdentityInfo  `json:"identities"`
+	Total      int             `json:"total"`
+	Successful int             `json:"successful"`
+	Failed     []string        `json:"failed"`
 }
 
 func main() {
-	config := loadConfig()
-	
-	indexer, err := NewIndexer(config)
-	if err != nil {
-		log.Fatalf("Erreur de création de l'indexeur: %v", err)
+	if len(os.Args) < 2 {
+		log.Fatal("Usage: go run identity_fetcher.go <config_file>")
 	}
-	defer indexer.Close()
 
-	log.Println("Indexeur démarré...")
-	indexer.Run()
+	configFile := os.Args[1]
+	config, err := loadConfig(configFile)
+	if err != nil {
+		log.Fatalf("Erreur de chargement de config: %v", err)
+	}
+
+	addresses, err := loadAddresses(config.AddressListFile)
+	if err != nil {
+		log.Fatalf("Error loading addresses: %v", err)
+	}
+
+	log.Printf("Fetching information for %d addresses...", len(addresses))
+
+	fetcher := NewIdentityFetcher(config)
+	snapshot := fetcher.FetchIdentities(addresses)
+
+	if err := saveSnapshot(snapshot, config.OutputFile); err != nil {
+		log.Fatalf("Error saving snapshot: %v", err)
+	}
+
+	log.Printf("Completed! %d/%d identities fetched successfully", 
+		snapshot.Successful, snapshot.Total)
+	
+	if len(snapshot.Failed) > 0 {
+		log.Printf("Failed addresses: %v", snapshot.Failed)
+	}
 }
 
-func loadConfig() IndexerConfig {
-	// Priorité aux variables d'environnement
-	config := IndexerConfig{
-		RPCURL:          getEnv("RPC_URL", "http://localhost:9009"),
-		RPCKey:          getEnv("RPC_KEY", ""),
-		IntervalMinutes: getEnvInt("FETCH_INTERVAL_MINUTES", 10),
-		DBPath:          getEnv("DB_PATH", "identities.db"),
+func loadConfig(filename string) (*FetcherConfig, error) {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, err
 	}
 
-	// Essayer de charger config.json si il existe
-	if configFile, err := ioutil.ReadFile("config.json"); err == nil {
-		var fileConfig IndexerConfig
-		if json.Unmarshal(configFile, &fileConfig) == nil {
-			// Les variables d'environnement ont priorité
-			if config.RPCURL == "http://localhost:9009" && fileConfig.RPCURL != "" {
-				config.RPCURL = fileConfig.RPCURL
-			}
-			if config.RPCKey == "" && fileConfig.RPCKey != "" {
-				config.RPCKey = fileConfig.RPCKey
-			}
-			if config.IntervalMinutes == 10 && fileConfig.IntervalMinutes != 0 {
-				config.IntervalMinutes = fileConfig.IntervalMinutes
-			}
-			if config.DBPath == "identities.db" && fileConfig.DBPath != "" {
-				config.DBPath = fileConfig.DBPath
-			}
+	var config FetcherConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+
+	// Default values
+	if config.BatchSize == 0 {
+		config.BatchSize = 100
+	}
+	if config.TimeoutSeconds == 0 {
+		config.TimeoutSeconds = 30
+	}
+	if config.OutputFile == "" {
+		config.OutputFile = "snapshot.json"
+	}
+
+	return &config, nil
+}
+
+func loadAddresses(filename string) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var addresses []string
+	scanner := bufio.NewScanner(file)
+	
+	for scanner.Scan() {
+		address := strings.TrimSpace(scanner.Text())
+		if address != "" && !strings.HasPrefix(address, "#") {
+			addresses = append(addresses, address)
 		}
 	}
 
-	return config
+	return addresses, scanner.Err()
 }
 
-func NewIndexer(config IndexerConfig) (*Indexer, error) {
-	db, err := sql.Open("sqlite3", config.DBPath)
-	if err != nil {
-		return nil, err
-	}
+type IdentityFetcher struct {
+	config *FetcherConfig
+	client *http.Client
+}
 
-	// Créer les tables
-	createTables := `
-	CREATE TABLE IF NOT EXISTS identities (
-		address TEXT PRIMARY KEY,
-		state TEXT NOT NULL,
-		stake REAL NOT NULL,
-		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_state ON identities(state);
-	CREATE INDEX IF NOT EXISTS idx_eligible ON identities(state, stake);
-	`
-
-	if _, err := db.Exec(createTables); err != nil {
-		return nil, err
-	}
-
-	indexer := &Indexer{
+func NewIdentityFetcher(config *FetcherConfig) *IdentityFetcher {
+	return &IdentityFetcher{
 		config: config,
-		db:     db,
-	}
-
-	// Démarrer le serveur HTTP
-	go indexer.startHTTPServer()
-
-	return indexer, nil
-}
-
-func (i *Indexer) Run() {
-	ticker := time.NewTicker(time.Duration(i.config.IntervalMinutes) * time.Minute)
-	defer ticker.Stop()
-
-	// Premier fetch immédiat
-	i.fetchIdentities()
-
-	// Puis fetch périodique
-	for range ticker.C {
-		i.fetchIdentities()
+		client: &http.Client{
+			Timeout: time.Duration(config.TimeoutSeconds) * time.Second,
+		},
 	}
 }
 
-func (i *Indexer) fetchIdentities() {
-	log.Println("Récupération des identités...")
+func (f *IdentityFetcher) FetchIdentities(addresses []string) *Snapshot {
+	snapshot := &Snapshot{
+		Timestamp:  time.Now(),
+		Identities: make([]IdentityInfo, 0),
+		Total:      len(addresses),
+		Failed:     make([]string, 0),
+	}
 
-	// Préparer la requête RPC
+	// Process in batches to avoid server overload
+	for i := 0; i < len(addresses); i += f.config.BatchSize {
+		end := i + f.config.BatchSize
+		if end > len(addresses) {
+			end = len(addresses)
+		}
+
+		batch := addresses[i:end]
+		log.Printf("Processing batch %d-%d/%d", i+1, end, len(addresses))
+
+		for _, address := range batch {
+			identity, err := f.fetchIdentity(address)
+			if err != nil {
+				log.Printf("Error for %s: %v", address, err)
+				snapshot.Failed = append(snapshot.Failed, address)
+				continue
+			}
+
+			snapshot.Identities = append(snapshot.Identities, *identity)
+			snapshot.Successful++
+		}
+
+		// Small pause between batches
+		if end < len(addresses) {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	return snapshot
+}
+
+func (f *IdentityFetcher) fetchIdentity(address string) (*IdentityInfo, error) {
 	request := RPCRequest{
-		Method: "dna_identities",
-		Params: []interface{}{},
+		Method: "dna_identity",
+		Params: []interface{}{address},
 		ID:     1,
 	}
 
 	jsonData, err := json.Marshal(request)
 	if err != nil {
-		log.Printf("Erreur de sérialisation: %v", err)
-		return
+		return nil, err
 	}
 
-	// Créer la requête HTTP
-	req, err := http.NewRequest("POST", i.config.RPCURL, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest("POST", f.config.RPCURL, bytes.NewBuffer(jsonData))
 	if err != nil {
-		log.Printf("Erreur de création de requête: %v", err)
-		return
+		return nil, err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	if i.config.RPCKey != "" {
-		req.Header.Set("Authorization", "Bearer "+i.config.RPCKey)
+	if f.config.RPCKey != "" {
+		req.Header.Set("Authorization", "Bearer "+f.config.RPCKey)
 	}
 
-	// Envoyer la requête
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := f.client.Do(req)
 	if err != nil {
-		log.Printf("Erreur de requête RPC: %v", err)
-		return
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// Lire la réponse
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("Erreur de lecture de réponse: %v", err)
-		return
+		return nil, err
 	}
 
-	// Parser la réponse
 	var rpcResponse RPCResponse
 	if err := json.Unmarshal(body, &rpcResponse); err != nil {
-		log.Printf("Erreur de parsing de réponse: %v", err)
-		return
+		return nil, err
 	}
 
 	if rpcResponse.Error != nil {
-		log.Printf("Erreur RPC: %s", rpcResponse.Error.Message)
-		return
+		return nil, fmt.Errorf("RPC error: %s", rpcResponse.Error.Message)
 	}
 
-	// Mettre à jour la base de données
-	i.updateDatabase(rpcResponse.Result)
+	if rpcResponse.Result == nil {
+		return nil, fmt.Errorf("no result for address %s", address)
+	}
+
+	// Ensure address is set
+	rpcResponse.Result.Address = address
+
+	return rpcResponse.Result, nil
 }
 
-func (i *Indexer) updateDatabase(identities []IdenaIdentity) {
-	tx, err := i.db.Begin()
+func saveSnapshot(snapshot *Snapshot, filename string) error {
+	data, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
-		log.Printf("Erreur de transaction: %v", err)
-		return
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO identities (address, state, stake, updated_at) 
-		VALUES (?, ?, ?, ?)
-	`)
-	if err != nil {
-		log.Printf("Erreur de préparation: %v", err)
-		return
-	}
-	defer stmt.Close()
-
-	updated := 0
-	for _, identity := range identities {
-		_, err := stmt.Exec(
-			identity.Address,
-			identity.State,
-			identity.Stake,
-			time.Now(),
-		)
-		if err != nil {
-			log.Printf("Erreur d'insertion pour %s: %v", identity.Address, err)
-			continue
-		}
-		updated++
+		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		log.Printf("Erreur de commit: %v", err)
-		return
-	}
-
-	log.Printf("Identités mises à jour: %d/%d", updated, len(identities))
-}
-
-func (i *Indexer) startHTTPServer() {
-	http.HandleFunc("/identities/latest", i.handleLatestIdentities)
-	http.HandleFunc("/identities/eligible", i.handleEligibleIdentities)
-	http.HandleFunc("/identity/", i.handleSingleIdentity)
-	http.HandleFunc("/state/", i.handleStateFilter)
-
-	log.Println("Serveur HTTP démarré sur :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-func (i *Indexer) handleLatestIdentities(w http.ResponseWriter, r *http.Request) {
-	rows, err := i.db.Query("SELECT address, state, stake, updated_at FROM identities ORDER BY updated_at DESC")
-	if err != nil {
-		http.Error(w, "Erreur de base de données", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var identities []map[string]interface{}
-	for rows.Next() {
-		var address, state string
-		var stake float64
-		var updatedAt time.Time
-
-		if err := rows.Scan(&address, &state, &stake, &updatedAt); err != nil {
-			continue
-		}
-
-		identities = append(identities, map[string]interface{}{
-			"address":    address,
-			"state":      state,
-			"stake":      stake,
-			"updated_at": updatedAt,
-		})
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(identities)
-}
-
-func (i *Indexer) handleEligibleIdentities(w http.ResponseWriter, r *http.Request) {
-	rows, err := i.db.Query(`
-		SELECT address, state, stake FROM identities 
-		WHERE state IN ('Human', 'Verified', 'Newbie') AND stake >= 10000
-		ORDER BY address
-	`)
-	if err != nil {
-		http.Error(w, "Erreur de base de données", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var addresses []string
-	for rows.Next() {
-		var address, state string
-		var stake float64
-
-		if err := rows.Scan(&address, &state, &stake); err != nil {
-			continue
-		}
-		addresses = append(addresses, address)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"addresses": addresses,
-		"count":     len(addresses),
-	})
-}
-
-func (i *Indexer) handleSingleIdentity(w http.ResponseWriter, r *http.Request) {
-	address := strings.TrimPrefix(r.URL.Path, "/identity/")
-	if address == "" {
-		http.Error(w, "Adresse manquante", http.StatusBadRequest)
-		return
-	}
-
-	var state string
-	var stake float64
-	var updatedAt time.Time
-
-	err := i.db.QueryRow(
-		"SELECT state, stake, updated_at FROM identities WHERE address = ?",
-		address,
-	).Scan(&state, &stake, &updatedAt)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			http.Error(w, "Identité non trouvée", http.StatusNotFound)
-		} else {
-			http.Error(w, "Erreur de base de données", http.StatusInternalServerError)
-		}
-		return
-	}
-
-	response := map[string]interface{}{
-		"address":    address,
-		"state":      state,
-		"stake":      stake,
-		"updated_at": updatedAt,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-func (i *Indexer) handleStateFilter(w http.ResponseWriter, r *http.Request) {
-	state := strings.TrimPrefix(r.URL.Path, "/state/")
-	if state == "" {
-		http.Error(w, "État manquant", http.StatusBadRequest)
-		return
-	}
-
-	rows, err := i.db.Query(
-		"SELECT address, stake FROM identities WHERE state = ? ORDER BY address",
-		state,
-	)
-	if err != nil {
-		http.Error(w, "Erreur de base de données", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var identities []map[string]interface{}
-	for rows.Next() {
-		var address string
-		var stake float64
-
-		if err := rows.Scan(&address, &stake); err != nil {
-			continue
-		}
-
-		identities = append(identities, map[string]interface{}{
-			"address": address,
-			"stake":   stake,
-			"state":   state,
-		})
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(identities)
-}
-
-func (i *Indexer) Close() {
-	if i.db != nil {
-		i.db.Close()
-	}
-}
-
-func getEnvInt(key string, defaultValue int) int {
-	value := os.Getenv(key)
-	if value == "" {
-		return defaultValue
-	}
-	
-	intValue, err := strconv.Atoi(value)
-	if err != nil {
-		return defaultValue
-	}
-	
-	return intValue
+	return ioutil.WriteFile(filename, data, 0644)
 }
